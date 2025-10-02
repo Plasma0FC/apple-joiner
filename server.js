@@ -5,7 +5,7 @@ const cors = require("cors");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Chave de autenticação
+// 🔑 Chave de autenticação
 const API_KEY = "Apple2502!@";
 
 // Armazena em memória
@@ -15,6 +15,8 @@ let jobs = {
   high: [],
   ultra: []
 };
+
+let usedJobs = new Set(); // guarda JobIds já usados
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -28,7 +30,9 @@ function checkAuth(req, res, next) {
   next();
 }
 
+// ============================
 // Receber job (Server Hop envia aqui)
+// ============================
 app.post("/submit", checkAuth, (req, res) => {
   const { jobId, petName, petValue, range } = req.body;
   if (!jobId || !petName || !petValue || !range) {
@@ -36,25 +40,42 @@ app.post("/submit", checkAuth, (req, res) => {
   }
 
   if (!jobs[range]) jobs[range] = [];
-  jobs[range].push({
-    jobId,
-    petName,
-    petValue,
-    timestamp: Date.now()
-  });
+  if (!usedJobs.has(jobId)) { // evita duplicar
+    jobs[range].push({
+      jobId,
+      petName,
+      petValue,
+      timestamp: Date.now()
+    });
 
-  // Mantém só últimos 20 por range
-  if (jobs[range].length > 20) jobs[range].shift();
+    // Mantém só últimos 50 por range
+    if (jobs[range].length > 50) jobs[range].shift();
 
-  console.log(`[Server] Novo job em ${range}: ${petName} ($${petValue}) -> ${jobId}`);
+    console.log(`[Server] Novo job em ${range}: ${petName} ($${petValue}) -> ${jobId}`);
+  }
+
   res.json({ success: true });
 });
 
-// Retornar jobs por range (Joiner consome aqui)
+// ============================
+// Pegar próximo job disponível (joiner usa isso)
+// ============================
 app.get("/jobs/:range", checkAuth, (req, res) => {
   const range = req.params.range;
   if (!jobs[range]) return res.status(404).json({ error: "Range inválido" });
-  res.json(jobs[range]);
+
+  // procura o primeiro que ainda não foi usado
+  const available = jobs[range].find(j => !usedJobs.has(j.jobId));
+
+  if (!available) {
+    return res.json({ jobId: null });
+  }
+
+  // marca como usado imediatamente
+  usedJobs.add(available.jobId);
+  console.log(`[Server] JobId entregue e marcado como usado -> ${available.jobId}`);
+
+  res.json(available);
 });
 
 app.listen(PORT, () => {
