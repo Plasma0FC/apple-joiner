@@ -3,9 +3,9 @@ const bodyParser = require("body-parser");
 const cors = require("cors");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
-// 🔑 Chave de autenticação
+// Chave de autenticação
 const API_KEY = "Apple2502!@";
 
 // Armazena em memória
@@ -16,7 +16,10 @@ let jobs = {
   ultra: []
 };
 
-let usedJobs = new Set(); // guarda JobIds já usados
+let blacklist = []; // { jobId, reason, expiresAt }
+
+// TTL da blacklist em ms (45 minutos)
+const BLACKLIST_TTL = 45 * 60 * 1000;
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -30,9 +33,9 @@ function checkAuth(req, res, next) {
   next();
 }
 
-// ============================
+// ===============================
 // Receber job (Server Hop envia aqui)
-// ============================
+// ===============================
 app.post("/submit", checkAuth, (req, res) => {
   const { jobId, petName, petValue, range } = req.body;
   if (!jobId || !petName || !petValue || !range) {
@@ -40,44 +43,72 @@ app.post("/submit", checkAuth, (req, res) => {
   }
 
   if (!jobs[range]) jobs[range] = [];
-  if (!usedJobs.has(jobId)) { // evita duplicar
-    jobs[range].push({
-      jobId,
-      petName,
-      petValue,
-      timestamp: Date.now()
-    });
+  jobs[range].push({
+    jobId,
+    petName,
+    petValue,
+    timestamp: Date.now()
+  });
 
-    // Mantém só últimos 50 por range
-    if (jobs[range].length > 50) jobs[range].shift();
+  // Mantém só últimos 20 por range
+  if (jobs[range].length > 20) jobs[range].shift();
 
-    console.log(`[Server] Novo job em ${range}: ${petName} ($${petValue}) -> ${jobId}`);
-  }
-
+  console.log(`[Server] Novo job em ${range}: ${petName} ($${petValue}) -> ${jobId}`);
   res.json({ success: true });
 });
 
-// ============================
-// Pegar próximo job disponível (joiner usa isso)
-// ============================
+// ===============================
+// Retornar jobs por range (Joiner consome aqui)
+// ===============================
 app.get("/jobs/:range", checkAuth, (req, res) => {
   const range = req.params.range;
   if (!jobs[range]) return res.status(404).json({ error: "Range inválido" });
 
-  // procura o primeiro que ainda não foi usado
-  const available = jobs[range].find(j => !usedJobs.has(j.jobId));
+  // limpa blacklist expirada antes
+  cleanupBlacklist();
 
-  if (!available) {
-    return res.json({ jobId: null });
-  }
-
-  // marca como usado imediatamente
-  usedJobs.add(available.jobId);
-  console.log(`[Server] JobId entregue e marcado como usado -> ${available.jobId}`);
-
-  res.json(available);
+  res.json(jobs[range]);
 });
 
+// ===============================
+// Blacklist - adicionar
+// ===============================
+app.post("/blacklist/add", checkAuth, (req, res) => {
+  const { jobId, reason } = req.body;
+  if (!jobId) return res.status(400).json({ error: "jobId inválido" });
+
+  blacklist.push({
+    jobId,
+    reason: reason || "auto",
+    expiresAt: Date.now() + BLACKLIST_TTL
+  });
+
+  console.log(`[Blacklist] Job ${jobId} adicionado (${reason || "auto"})`);
+  res.json({ success: true });
+});
+
+// ===============================
+// Blacklist - verificar
+// ===============================
+app.get("/blacklist/check/:jobId", checkAuth, (req, res) => {
+  const jobId = req.params.jobId;
+  cleanupBlacklist();
+
+  const found = blacklist.find((b) => b.jobId === jobId);
+  if (found) {
+    return res.json({ blacklisted: true, reason: found.reason });
+  }
+  res.json({ blacklisted: false });
+});
+
+// ===============================
+// Função para limpar expirados
+// ===============================
+function cleanupBlacklist() {
+  const now = Date.now();
+  blacklist = blacklist.filter((b) => b.expiresAt > now);
+}
+
 app.listen(PORT, () => {
-  console.log(`Servidor JSON rodando na porta ${PORT}`);
+  console.log(`Servidor AppleHub rodando na porta ${PORT}`);
 });
