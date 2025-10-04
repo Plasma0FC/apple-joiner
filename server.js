@@ -6,12 +6,12 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // Chave de autenticação
-const API_KEY = "Apple2502!@";
+const API_KEY = process.env.API_KEY || "Apple2502!@";  // Usar variáveis de ambiente
 
 const RANGES = ["low", "mid", "high", "ultra"];
 const MAX_JOBS_PER_RANGE = 50;
 const BLACKLIST_TTL = 45 * 60 * 1000; // 45 minutos
-const JOB_RETENTION_TTL = 30 * 60 * 1000; // remove jobs antigos após 30 min
+const JOB_RETENTION_TTL = 30 * 60 * 1000; // Remove jobs antigos após 30 min
 
 // Armazena jobs em memória por range
 const jobs = RANGES.reduce((acc, range) => {
@@ -143,9 +143,7 @@ app.post("/submit", checkAuth, (req, res) => {
   ensureRange(range).set(jobId, jobEntry);
   trimRange(range);
 
-  console.log(
-    `[Server] Novo job em ${range}: ${petName} ($${normalizedValue.toLocaleString("en-US")}) -> ${jobId}`
-  );
+  console.log(`[Server] Novo job em ${range}: ${petName} ($${normalizedValue.toLocaleString("en-US")}) -> ${jobId}`);
 
   return res.json({ success: true, stored: true });
 });
