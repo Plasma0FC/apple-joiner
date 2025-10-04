@@ -7,8 +7,11 @@ local http_service = game:GetService("HttpService")
 local teleport_service = game:GetService("TeleportService")
 local players = game:GetService("Players")
 
+repeat task.wait() until players.LocalPlayer
+
 local place_id = tostring(game.PlaceId)
 local job_id = game.JobId
+local previous_job_id = job_id
 local http_request = request or http_request or syn.request
 
 -- API Railway
@@ -30,52 +33,67 @@ local mid_min, mid_max = 50000000, 100000000
 local high_min, high_max = 100000000, 500000000
 local highm_min, highm_max = 500000000, 100000000000
 
+local RANGE_PRIORITY = { "ultra", "high", "mid", "low" }
+
 -- Cache local
 local last_sent_data = {}
+
+local local_player = players.LocalPlayer
+local account_id = local_player and tostring(local_player.UserId) or "unknown"
+local agent_identifier = (local_player and local_player.Name or "anon") .. "-" .. http_service:GenerateGUID(false)
 
 -- ===============================
 -- Helpers HTTP
 -- ===============================
-local function post_json(url, body_tbl)
-    return pcall(function()
-        return http_request({
-            Url = url,
-            Method = "POST",
-            Headers = {
-                ["Content-Type"] = "application/json",
-                ["x-api-key"] = API_KEY
-            },
-            Body = http_service:JSONEncode(body_tbl)
-        })
-    end)
-end
+local function server_request(method, path, body_tbl)
+    local request_data = {
+        Url = SERVER_URL .. path,
+        Method = method,
+        Headers = {
+            ["x-api-key"] = API_KEY
+        }
+    }
 
-local function get_json(url)
+    if body_tbl then
+        request_data.Headers["Content-Type"] = "application/json"
+        request_data.Body = http_service:JSONEncode(body_tbl)
+    end
+
     local ok, resp = pcall(function()
-        return http_request({
-            Url = url,
-            Method = "GET",
-            Headers = {
-                ["x-api-key"] = API_KEY
-            }
-        })
+        return http_request(request_data)
     end)
-    if not ok or not resp or not resp.Body then return nil end
-    local ok2, data = pcall(http_service.JSONDecode, http_service, resp.Body)
-    if not ok2 then return nil end
-    return data
+
+    if not ok or not resp then
+        warn("[APPLE] Falha ao se comunicar com " .. path)
+        return nil
+    end
+
+    local result = {}
+    if resp.Body and resp.Body ~= "" then
+        local ok_json, decoded = pcall(http_service.JSONDecode, http_service, resp.Body)
+        if ok_json and type(decoded) == "table" then
+            result = decoded
+        end
+    end
+
+    result.status = resp.StatusCode
+    return result
+end
+
+local function server_get(path)
+    return server_request("GET", path)
+end
+
+local function server_post(path, body_tbl)
+    return server_request("POST", path, body_tbl)
 end
 
 -- ===============================
--- Verificação de Blacklist
+-- Blacklist
 -- ===============================
-local function is_blacklisted(jobId)
-    local data = get_json(SERVER_URL .. "/blacklist/check/" .. jobId)
-    return data and data.blacklisted
-end
-
 local function add_to_blacklist(jobId)
-    post_json(SERVER_URL .. "/blacklist/add", {
+    if not jobId then return end
+    server_post("/blacklist/add", {
         jobId = jobId,
         reason = "already_visited"
     })
@@ -86,12 +104,13 @@ end
 -- Envio para servidor
 -- ===============================
 local function send_to_server(jobId, petName, petValue, range)
-    if not jobId or not petName or not petValue or not range then return end
-    post_json(SERVER_URL .. "/submit", {
+    if not jobId or not petName or petValue == nil or not range then return end
+    server_post("/submit", {
         jobId = jobId,
         petName = petName,
         petValue = petValue,
-        range = range
+        range = range,
+        accountId = account_id
     })
     print("[APPLE] 🌐 Enviado ao servidor:", petName, petValue, jobId)
 end
@@ -152,7 +171,6 @@ local function send_discord(best_by_plot)
                 timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z")
             }
 
-            -- Envia embed normal
             pcall(function()
                 http_request({
                     Url = url,
@@ -162,7 +180,6 @@ local function send_discord(best_by_plot)
                 })
             end)
 
-            -- Envia clutch se não for verylow
             if best.section ~= "verylow" then
                 pcall(function()
                     http_request({
@@ -182,6 +199,66 @@ local function send_discord(best_by_plot)
     send_webhook(webhook_high, "high")
     send_webhook(webhook_highm, "ultra")
 end
+
+-- ===============================
+-- Helpers utilitárias
+-- ===============================
+local SUFFIXES = {
+    K = 1e3,
+    M = 1e6,
+    B = 1e9,
+    T = 1e12,
+    QA = 1e15,
+    QI = 1e18,
+    SX = 1e21,
+    SP = 1e24,
+    OC = 1e27,
+    NO = 1e30,
+    DC = 1e33
+}
+
+local function parse_amount(text)
+    if not text then
+        return 0
+    end
+    local cleaned = tostring(text):upper():gsub("%s", "")
+    local numeric = tonumber(cleaned)
+    if numeric then
+        return numeric
+    end
+
+    local value_part, suffix_part = cleaned:match("([%d%.]+)([A-Z]+)")
+    if value_part and suffix_part then
+        local suffix_value = SUFFIXES[suffix_part]
+        if suffix_value then
+            return tonumber(value_part) * suffix_value
+        end
+    end
+
+    return 0
+end
+
+local function get_plot_display_name(plot)
+    if not plot then
+        return "UnknownPlot"
+    end
+
+    local attribute_name = plot:GetAttribute("DisplayName")
+    if attribute_name and attribute_name ~= "" then
+        return tostring(attribute_name)
+    end
+
+    local billboard = plot:FindFirstChildWhichIsA("BillboardGui", true)
+    if billboard then
+        local label = billboard:FindFirstChildWhichIsA("TextLabel", true)
+        if label and label.Text and label.Text ~= "" then
+            return label.Text
+        end
+    end
+
+    return plot.Name
+end
+
 
 -- ===============================
 -- Scanner de Pets
@@ -244,7 +321,6 @@ local function scan_and_report()
                 send_to_server(job_id, best.animal or plot, best.value or 0, best.section)
             end
         end
-        -- Envia para Discord
         send_discord(best_by_plot)
         return true
     else
@@ -253,50 +329,75 @@ local function scan_and_report()
 end
 
 -- ===============================
--- Server Hop com Blacklist
+-- Server Hop via claim exclusivo
 -- ===============================
-local function server_hop(range)
-    local jobs = get_json(SERVER_URL .. "/jobs/" .. range)
-    if not jobs or #jobs == 0 then
-        print("[APPLE] ❌ Nenhum job disponível no range:", range)
-        return
+local function claim_and_hop(range)
+    local response = server_post("/jobs/claim", {
+        range = range,
+        agentId = agent_identifier,
+        currentJobId = job_id
+    })
+
+    if not response then
+        print("[APPLE] ⚠️ Falha ao conversar com o servidor (" .. range .. ")")
+        return false
     end
 
-    local available_jobs = {}
+    if response.status and response.status >= 400 then
+        print("[APPLE] ❌ Erro " .. response.status .. " ao solicitar job (" .. range .. ")")
+        return false
+    end
 
-    -- Filtra os jobs não presentes na blacklist
-    for _, job in ipairs(jobs) do
-        if not is_blacklisted(job.jobId) then
-            table.insert(available_jobs, job)
+    if not response.success or not response.job then
+        if response.reason then
+            print("[APPLE] ⚪ " .. range .. " sem job: " .. response.reason)
+        else
+            print("[APPLE] ⚪ Nenhum job disponível em " .. range)
         end
+        return false
     end
 
-    -- Se houver jobs disponíveis que não foram visitados, escolhe aleatoriamente
-    if #available_jobs > 0 then
-        local selected_job = available_jobs[math.random(1, #available_jobs)]
-        add_to_blacklist(selected_job.jobId)  -- Adiciona o job à blacklist
-
-        -- Teleporta para o job selecionado
-        print("[APPLE] 🔄 Hop para", selected_job.jobId)
-        teleport_service:TeleportToPlaceInstance(place_id, selected_job.jobId, players.LocalPlayer)
-    else
-        print("[APPLE] ❌ Nenhum servidor disponível que não tenha sido visitado.")
+    local job_info = response.job
+    if not job_info.jobId then
+        print("[APPLE] ⚠️ Resposta sem jobId válido.")
+        return false
     end
+
+    if job_info.jobId == job_id then
+        print("[APPLE] ⏭️ Job retornado é o atual, ignorando.")
+        return false
+    end
+
+    print("[APPLE] 🔄 Hop para " .. job_info.jobId .. " (" .. range .. ")")
+    teleport_service:TeleportToPlaceInstance(place_id, job_info.jobId, players.LocalPlayer)
+    return true
+end
+
+local function hop_next_available()
+    for _, range in ipairs(RANGE_PRIORITY) do
+        if claim_and_hop(range) then
+            return true
+        end
+        task.wait(0.3)
+    end
+    return false
 end
 
 -- ===============================
 -- Loop principal
 -- ===============================
 while true do
-    if workspace and workspace:FindFirstChild("Plots") then
-        local found = scan_and_report()
-        task.wait(1)
-        server_hop("low")
-        server_hop("mid")
-        server_hop("high")
-        server_hop("ultra")
-    else
-        server_hop("low")
+    job_id = game.JobId
+    if job_id ~= previous_job_id then
+        previous_job_id = job_id
+        last_sent_data = {}
     end
+
+    if workspace and workspace:FindFirstChild("Plots") then
+        scan_and_report()
+    end
+
+    task.wait(1)
+    hop_next_available()
     task.wait(2)
 end
