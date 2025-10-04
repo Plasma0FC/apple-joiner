@@ -1,232 +1,229 @@
+/* server.js */
 const express = require("express");
-const bodyParser = require("body-parser");
-const cors = require("cors");
+const morgan = require("morgan");
+
+const PORT = process.env.PORT || 8080;
+const API_KEY = process.env.API_KEY || "Apple2502!@";
+const CLAIM_TTL_MS = Number(process.env.CLAIM_TTL_MS || 120000); // 2 min
+const VISITED_TTL_MS = Number(process.env.VISITED_TTL_MS || 45 * 60 * 1000); // 45 min
+const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 30000);
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+app.use(express.json({ limit: "256kb" }));
+app.use(morgan("tiny"));
 
-// Chave de autenticação
-const API_KEY = process.env.API_KEY || "Apple2502!@";  // Usar variáveis de ambiente
+const claims = new Map();            // key => claim record
+const visited = new Map();           // key => visited record
+const accountAssignments = new Map();// accountId => key
 
-const RANGES = ["low", "mid", "high", "ultra"];
-const MAX_JOBS_PER_RANGE = 50;
-const BLACKLIST_TTL = 45 * 60 * 1000; // 45 minutos
-const JOB_RETENTION_TTL = 30 * 60 * 1000; // Remove jobs antigos após 30 min
+const now = () => Date.now();
+const jobKey = (placeId, jobId) => `${placeId}:${jobId}`;
 
-// Armazena jobs em memória por range
-const jobs = RANGES.reduce((acc, range) => {
-  acc[range] = new Map();
-  return acc;
-}, {});
-
-let blacklist = []; // { jobId, reason, expiresAt }
-
-app.use(cors());
-app.use(bodyParser.json());
-
-// ===============================
-// Helpers
-// ===============================
-function checkAuth(req, res, next) {
-  const key = req.headers["x-api-key"];
-  if (key !== API_KEY) {
-    return res.status(403).json({ error: "Acesso negado" });
-  }
-  return next();
-}
-
-function isValidRange(range) {
-  return RANGES.includes(range);
-}
-
-function ensureRange(range) {
-  if (!jobs[range]) {
-    jobs[range] = new Map();
-  }
-  return jobs[range];
-}
-
-function addToBlacklist(jobId, reason, ttl = BLACKLIST_TTL) {
-  const payload = {
-    jobId,
-    reason: reason || "auto",
-    expiresAt: Date.now() + ttl
+const safeRecord = (record) => {
+  if (!record) return null;
+  const { metadata, ...rest } = record;
+  return {
+    ...rest,
+    metadata: metadata || {},
   };
-  const idx = blacklist.findIndex((entry) => entry.jobId === jobId);
-  if (idx >= 0) {
-    blacklist[idx] = payload;
-  } else {
-    blacklist.push(payload);
-  }
-}
+};
 
-function isBlacklisted(jobId) {
-  return blacklist.some((entry) => entry.jobId === jobId);
-}
+const cleanup = () => {
+  const ts = now();
 
-function cleanupBlacklist() {
-  const now = Date.now();
-  blacklist = blacklist.filter((entry) => entry.expiresAt > now);
-}
-
-function cleanupJobs() {
-  const now = Date.now();
-  for (const range of Object.keys(jobs)) {
-    const rangeMap = ensureRange(range);
-    for (const [jobId, job] of rangeMap.entries()) {
-      if (!job.lastSeen || now - job.lastSeen > JOB_RETENTION_TTL) {
-        rangeMap.delete(jobId);
+  for (const [key, record] of claims) {
+    if (record.expiresAt <= ts) {
+      claims.delete(key);
+      if (accountAssignments.get(record.accountId) === key) {
+        accountAssignments.delete(record.accountId);
       }
     }
   }
-}
 
-function trimRange(range) {
-  const rangeMap = ensureRange(range);
-  if (rangeMap.size <= MAX_JOBS_PER_RANGE) return;
-
-  const orderedByAge = [...rangeMap.values()].sort((a, b) => a.lastSeen - b.lastSeen);
-  while (rangeMap.size > MAX_JOBS_PER_RANGE && orderedByAge.length) {
-    const oldest = orderedByAge.shift();
-    rangeMap.delete(oldest.jobId);
+  for (const [key, record] of visited) {
+    if (record.expiresAt <= ts) {
+      visited.delete(key);
+    }
   }
-}
+};
 
-function serializeJobs(range) {
-  return [...ensureRange(range).values()].map((job) => ({
-    jobId: job.jobId,
-    petName: job.petName,
-    petValue: job.petValue,
-    petValueRaw: job.petValueRaw,
-    range: job.range,
-    accountId: job.accountId,
-    submittedAt: job.submittedAt,
-    lastSeen: job.lastSeen
-  }));
-}
+setInterval(cleanup, CLEANUP_INTERVAL_MS).unref();
 
-// ===============================
-// Receber job
-// ===============================
-app.post("/submit", checkAuth, (req, res) => {
-  const { jobId, petName, petValue, range, accountId } = req.body || {};
+app.get("/health", (_req, res) => {
+  cleanup();
+  res.json({ ok: true, claims: claims.size, visited: visited.size });
+});
 
-  if (!jobId || !petName || typeof petValue === "undefined" || !range) {
-    return res.status(400).json({ error: "Campos inválidos" });
+app.use((req, res, next) => {
+  if (req.path === "/health") {
+    return next();
   }
-  if (!isValidRange(range)) {
-    return res.status(400).json({ error: "Range inválido" });
+  const headerKey = req.get("x-api-key") || req.query.key;
+  if (headerKey !== API_KEY) {
+    return res.status(401).json({ ok: false, error: "invalid_api_key" });
   }
+  next();
+});
 
-  cleanupBlacklist();
-  cleanupJobs();
+app.get("/blacklist/check/:jobId", (req, res) => {
+  cleanup();
+  const placeId = req.query.placeId || "global";
+  const key = jobKey(placeId, req.params.jobId);
 
-  if (isBlacklisted(jobId)) {
-    return res.json({ success: false, ignored: true, reason: "blacklisted" });
+  const active = claims.get(key);
+  if (active) {
+    return res.json({
+      ok: true,
+      blocked: true,
+      reason: "claimed",
+      record: safeRecord(active),
+    });
   }
 
-  const now = Date.now();
-  const numericValue = Number(petValue);
-  const normalizedValue = Number.isFinite(numericValue) ? numericValue : 0;
+  const history = visited.get(key);
+  if (history) {
+    return res.json({
+      ok: true,
+      blocked: true,
+      reason: "visited",
+      record: safeRecord(history),
+    });
+  }
 
-  const jobEntry = {
+  res.json({ ok: true, blocked: false });
+});
+
+app.post("/blacklist/claim", (req, res) => {
+  cleanup();
+  const { placeId, jobId, accountId, username, metadata } = req.body;
+  if (!placeId || !jobId || !accountId) {
+    return res.status(400).json({ ok: false, error: "missing_fields" });
+  }
+
+  const key = jobKey(placeId, jobId);
+  const ts = now();
+
+  const visitRecord = visited.get(key);
+  if (visitRecord && visitRecord.expiresAt > ts) {
+    return res.status(409).json({
+      ok: false,
+      reason: "visited",
+      record: safeRecord(visitRecord),
+    });
+  }
+
+  const existing = claims.get(key);
+  if (existing && existing.accountId !== accountId && existing.expiresAt > ts) {
+    return res.status(409).json({
+      ok: false,
+      reason: "claimed",
+      record: safeRecord(existing),
+    });
+  }
+
+  const expiresAt = ts + CLAIM_TTL_MS;
+  const claim = {
+    placeId,
     jobId,
-    petName,
-    petValue: normalizedValue,
-    petValueRaw: petValue,
-    range,
-    accountId: accountId || null,
-    submittedAt: now,
-    lastSeen: now
+    accountId,
+    username: username || "unknown",
+    metadata: {
+      ...(existing ? existing.metadata : {}),
+      ...(metadata || {}),
+    },
+    createdAt: existing ? existing.createdAt : ts,
+    updatedAt: ts,
+    expiresAt,
   };
 
-  ensureRange(range).set(jobId, jobEntry);
-  trimRange(range);
+  claims.set(key, claim);
+  accountAssignments.set(accountId, key);
 
-  console.log(`[Server] Novo job em ${range}: ${petName} ($${normalizedValue.toLocaleString("en-US")}) -> ${jobId}`);
-
-  return res.json({ success: true, stored: true });
+  res.status(existing ? 200 : 201).json({
+    ok: true,
+    expiresAt,
+    record: safeRecord(claim),
+  });
 });
 
-// ===============================
-// Retornar jobs (debug)
-// ===============================
-app.get("/jobs/:range", checkAuth, (req, res) => {
-  const range = req.params.range;
-  if (!isValidRange(range)) {
-    return res.status(404).json({ error: "Range inválido" });
+app.post("/blacklist/heartbeat", (req, res) => {
+  cleanup();
+  const { placeId, jobId, accountId, metadata } = req.body;
+  if (!placeId || !jobId || !accountId) {
+    return res.status(400).json({ ok: false, error: "missing_fields" });
   }
 
-  cleanupBlacklist();
-  cleanupJobs();
+  const key = jobKey(placeId, jobId);
+  const claim = claims.get(key);
+  if (!claim || claim.accountId !== accountId) {
+    return res.status(404).json({ ok: false, error: "claim_not_found" });
+  }
 
-  return res.json(serializeJobs(range));
+  const ts = now();
+  claim.expiresAt = ts + CLAIM_TTL_MS;
+  claim.updatedAt = ts;
+  if (metadata) {
+    claim.metadata = { ...(claim.metadata || {}), ...metadata };
+  }
+
+  res.json({ ok: true, expiresAt: claim.expiresAt, record: safeRecord(claim) });
 });
 
-// ===============================
-// Claim exclusivo (joiners usam)
-// ===============================
-app.post("/jobs/claim", checkAuth, (req, res) => {
-  const { range, agentId } = req.body || {};
-
-  if (!range || !isValidRange(range)) {
-    return res.status(400).json({ error: "Range inválido" });
+app.post("/blacklist/complete", (req, res) => {
+  cleanup();
+  const { placeId, jobId, accountId, username, metadata, holdForMinutes } = req.body;
+  if (!placeId || !jobId) {
+    return res.status(400).json({ ok: false, error: "missing_fields" });
   }
 
-  cleanupBlacklist();
-  cleanupJobs();
+  const key = jobKey(placeId, jobId);
+  const ts = now();
+  const ttl = Math.max(1, Number(holdForMinutes) || (VISITED_TTL_MS / 60000)) * 60 * 1000;
 
-  const rangeMap = ensureRange(range);
-  if (!rangeMap.size) {
-    return res.json({ success: false, reason: "empty" });
+  const claim = claims.get(key);
+  const baseMetadata = claim ? claim.metadata : undefined;
+
+  claims.delete(key);
+  if (accountId && accountAssignments.get(accountId) === key) {
+    accountAssignments.delete(accountId);
   }
 
-  const candidates = [...rangeMap.values()].filter((job) => !isBlacklisted(job.jobId));
-  if (!candidates.length) {
-    return res.json({ success: false, reason: "no_available" });
-  }
+  const record = {
+    placeId,
+    jobId,
+    accountId: accountId || (claim && claim.accountId),
+    username: username || (claim && claim.username) || "unknown",
+    metadata: {
+      ...(baseMetadata || {}),
+      ...(metadata || {}),
+    },
+    visitedAt: ts,
+    expiresAt: ts + ttl,
+  };
 
-  candidates.sort((a, b) => (b.petValue || 0) - (a.petValue || 0));
-  const selected = candidates[0];
-
-  rangeMap.delete(selected.jobId);
-  addToBlacklist(selected.jobId, "claimed");
-
-  console.log(`[Claim] Job ${selected.jobId} (${range}) entregue para ${agentId || "unknown"}`);
-
-  return res.json({ success: true, job: selected });
+  visited.set(key, record);
+  res.json({ ok: true, expiresAt: record.expiresAt, record: safeRecord(record) });
 });
 
-// ===============================
-// Blacklist manual
-// ===============================
-app.post("/blacklist/add", checkAuth, (req, res) => {
-  const { jobId, reason } = req.body || {};
-  if (!jobId) {
-    return res.status(400).json({ error: "jobId inválido" });
+app.post("/blacklist/report", (req, res) => {
+  cleanup();
+  const { placeId, jobId, metadata } = req.body;
+  if (!placeId || !jobId || !metadata) {
+    return res.status(400).json({ ok: false, error: "missing_fields" });
   }
 
-  cleanupBlacklist();
-  addToBlacklist(jobId, reason || "auto");
-
-  console.log(`[Blacklist] Job ${jobId} adicionado (${reason || "auto"})`);
-  return res.json({ success: true });
-});
-
-// ===============================
-// Blacklist check
-// ===============================
-app.get("/blacklist/check/:jobId", checkAuth, (req, res) => {
-  const jobId = req.params.jobId;
-  cleanupBlacklist();
-
-  const found = blacklist.find((entry) => entry.jobId === jobId);
-  if (found) {
-    return res.json({ blacklisted: true, reason: found.reason, expiresAt: found.expiresAt });
+  const key = jobKey(placeId, jobId);
+  const target = claims.get(key) || visited.get(key);
+  if (!target) {
+    return res.status(404).json({ ok: false, error: "job_unknown" });
   }
-  return res.json({ blacklisted: false });
+
+  target.metadata = { ...(target.metadata || {}), ...metadata };
+  target.updatedAt = now();
+
+  res.json({ ok: true, record: safeRecord(target) });
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor AppleHub rodando na porta ${PORT}`);
+  console.log(`[apple-joiner] listening on :${PORT}`);
 });
